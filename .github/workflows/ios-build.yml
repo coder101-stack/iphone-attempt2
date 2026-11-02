@@ -1,8 +1,11 @@
 
-name: AREM iOS Build Check
+name: AREM TestFlight Build
 
 on:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   ios-build:
@@ -20,9 +23,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-
-      - name: Check Xcode
-        run: xcodebuild -version
 
       - name: Install dependencies
         run: npm ci
@@ -42,26 +42,115 @@ jobs:
           python3 - <<'PY'
           import json
           from pathlib import Path
-
-          folder = Path('ios/App/App/Assets.xcassets/AppIcon.appiconset')
+          folder = Path("ios/App/App/Assets.xcassets/AppIcon.appiconset")
           data = {
-              'images': [{
-                  'filename': 'AREMIcon.png',
-                  'idiom': 'universal',
-                  'platform': 'ios',
-                  'size': '1024x1024'
+              "images": [{
+                  "filename": "AREMIcon.png",
+                  "idiom": "universal",
+                  "platform": "ios",
+                  "size": "1024x1024"
               }],
-              'info': {'author': 'xcode', 'version': 1}
+              "info": {"author": "xcode", "version": 1}
           }
-          (folder / 'Contents.json').write_text(json.dumps(data, indent=2))
+          (folder / "Contents.json").write_text(json.dumps(data, indent=2))
           PY
 
-      - name: Compile iPhone simulator app
+      - name: Install Apple signing files
+        env:
+          CERT_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          PROFILE_BASE64: ${{ secrets.PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          set -euo pipefail
+          CERT="$RUNNER_TEMP/arem.p12"
+          PROFILE="$RUNNER_TEMP/arem.mobileprovision"
+          KEYCHAIN="$RUNNER_TEMP/arem.keychain-db"
+
+          printf '%s' "$CERT_BASE64" | base64 -D > "$CERT"
+          printf '%s' "$PROFILE_BASE64" | base64 -D > "$PROFILE"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$CERT" -P "$P12_PASSWORD" -t cert -f pkcs12 -k "$KEYCHAIN" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN"
+          security default-keychain -d user -s "$KEYCHAIN"
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+          security cms -D -i "$PROFILE" > "$RUNNER_TEMP/profile.plist"
+          UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$RUNNER_TEMP/profile.plist")
+          NAME=$(/usr/libexec/PlistBuddy -c 'Print :Name' "$RUNNER_TEMP/profile.plist")
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp "$PROFILE" "$HOME/Library/MobileDevice/Provisioning Profiles/$UUID.mobileprovision"
+          echo "PROFILE_NAME=$NAME" >> "$GITHUB_ENV"
+
+      - name: Archive AREM for iPhone
         run: |
           xcodebuild \
             -project ios/App/App.xcodeproj \
             -scheme App \
-            -configuration Debug \
-            -destination 'generic/platform=iOS Simulator' \
-            CODE_SIGNING_ALLOWED=NO \
-            build
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/AREM.xcarchive" \
+            DEVELOPMENT_TEAM=KSJG7FXDPA \
+            PRODUCT_BUNDLE_IDENTIFIER=app.arem.social \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="Apple Distribution" \
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
+            CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" \
+            archive
+
+      - name: Create export options
+        run: |
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>app-store-connect</string>
+            <key>destination</key>
+            <string>export</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>teamID</key>
+            <string>KSJG7FXDPA</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>app.arem.social</key>
+              <string>${PROFILE_NAME}</string>
+            </dict>
+          </dict>
+          </plist>
+          EOF
+
+      - name: Export signed IPA
+        run: |
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/AREM.xcarchive" \
+            -exportPath "$RUNNER_TEMP/AREM-Export" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist"
+
+      - name: Upload AREM to TestFlight
+        env:
+          API_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 }}
+          API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.appstoreconnect/private_keys"
+          KEY_PATH="$HOME/.appstoreconnect/private_keys/AuthKey_${API_KEY_ID}.p8"
+          printf '%s' "$API_KEY_BASE64" | base64 -D > "$KEY_PATH"
+          chmod 600 "$KEY_PATH"
+
+          IPA=$(find "$RUNNER_TEMP/AREM-Export" -name '*.ipa' -print -quit)
+          test -n "$IPA"
+
+          xcrun altool --upload-app \
+            -f "$IPA" \
+            -t ios \
+            --apiKey "$API_KEY_ID" \
+            --apiIssuer "$API_ISSUER_ID"
+  
