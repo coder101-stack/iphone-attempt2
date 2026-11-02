@@ -1,4 +1,3 @@
-
 name: AREM iOS Build Check
 
 on:
@@ -35,6 +34,27 @@ jobs:
           npx cap add ios
           npx cap sync ios
 
+      - name: Install AREM app icon
+        run: |
+          mkdir -p ios/App/App/Assets.xcassets/AppIcon.appiconset
+          cp assets/icon.png ios/App/App/Assets.xcassets/AppIcon.appiconset/AREMIcon.png
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          folder = Path('ios/App/App/Assets.xcassets/AppIcon.appiconset')
+          data = {
+              'images': [{
+                  'filename': 'AREMIcon.png',
+                  'idiom': 'universal',
+                  'platform': 'ios',
+                  'size': '1024x1024'
+              }],
+              'info': {'author': 'xcode', 'version': 1}
+          }
+          (folder / 'Contents.json').write_text(json.dumps(data, indent=2))
+          PY
+
       - name: Compile iPhone simulator app
         run: |
           xcodebuild \
@@ -44,4 +64,3 @@ jobs:
             -destination 'generic/platform=iOS Simulator' \
             CODE_SIGNING_ALLOWED=NO \
             build
-  
